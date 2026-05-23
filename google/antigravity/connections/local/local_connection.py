@@ -434,6 +434,8 @@ class LocalConnection(connection.Connection):
     self._tool_runner = tool_runner
     self._step_trackers: dict[tuple[str, int], _StepTracker] = {}
     self._step_queue = asyncio.Queue()
+    self._last_queued_step: LocalConnectionStep | None = None
+    self._pending_usage_metadata: types.UsageMetadata | None = None
     self._background_tasks = set()
     self._reader_task = asyncio.create_task(self._ws_reader_loop())
     self._current_turn_context = None
@@ -498,6 +500,8 @@ class LocalConnection(connection.Connection):
     self._parent_idle = False
     self._active_subagent_ids.clear()
     self._subagent_responses.clear()
+    self._last_queued_step = None
+    self._pending_usage_metadata = None
     if self._hook_runner:
       res, turn_context = await self._hook_runner.dispatch_pre_turn(prompt)
       self._current_turn_context = turn_context
@@ -748,6 +752,13 @@ class LocalConnection(connection.Connection):
         logging.info("RAW WS MSG: %s", raw_msg)
         event = localharness_pb2.OutputEvent()
         json_format.Parse(raw_msg, event)
+
+        if event.HasField("usage_metadata"):
+          parsed_usage = _parse_usage_metadata(event.usage_metadata)
+          self._pending_usage_metadata = parsed_usage
+          if self._last_queued_step is not None:
+            self._last_queued_step.usage_metadata = parsed_usage
+
         if event.HasField("step_update"):
           step_update = event.step_update
 
@@ -773,8 +784,13 @@ class LocalConnection(connection.Connection):
                     )
                 }
             )
+          elif self._pending_usage_metadata is not None:
+            step_obj = parsed_step.model_copy(
+                update={"usage_metadata": self._pending_usage_metadata}
+            )
           else:
             step_obj = parsed_step
+          self._last_queued_step = step_obj
           await self._step_queue.put(step_obj)
 
           # Record the cascade_id for use by TrajectoryStateUpdate
@@ -1149,6 +1165,9 @@ class LocalConnection(connection.Connection):
           status=types.StepStatus.ACTIVE,
           tool_calls=[tc],
       )
+      if self._pending_usage_metadata is not None:
+        tool_call_step.usage_metadata = self._pending_usage_metadata
+      self._last_queued_step = tool_call_step
       await self._step_queue.put(tool_call_step)
       op_context = None
 

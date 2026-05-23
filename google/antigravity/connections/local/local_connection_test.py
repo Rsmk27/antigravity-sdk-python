@@ -2498,6 +2498,104 @@ class LocalConnectionSubagentHookTest(unittest.IsolatedAsyncioTestCase):
         ),
     )
 
+  async def test_ws_reader_parses_usage_metadata_on_trajectory_state_update(self):
+    """Verifies that usage_metadata sent on a trajectory_state_update is attached to the last queued step."""
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
+        process=self.mock_process,
+    )
+
+    # 1. Send a step_update event first (the final finish or other step)
+    step_event = localharness_pb2.OutputEvent(
+        step_update=localharness_pb2.StepUpdate(
+            cascade_id="main",
+            trajectory_id="main",
+            step_index=1,
+            text="finish step",
+            state=localharness_pb2.StepUpdate.STATE_DONE,
+            source=localharness_pb2.StepUpdate.SOURCE_MODEL,
+        )
+    )
+    await harness.send_event(step_event)
+
+    # 2. Send a trajectory_state_update event with usage_metadata
+    idle_event = localharness_pb2.OutputEvent(
+        trajectory_state_update=localharness_pb2.TrajectoryStateUpdate(
+            trajectory_id="main",
+            state=localharness_pb2.TrajectoryStateUpdate.STATE_IDLE,
+        ),
+        usage_metadata=localharness_pb2.UsageMetadata(
+            prompt_token_count=150,
+            cached_content_token_count=50,
+            candidates_token_count=75,
+            thoughts_token_count=25,
+            total_token_count=250,
+        ),
+    )
+    await harness.send_event(idle_event)
+
+    # 3. Read the queued step and assert it has the usage metadata attached
+    step_obj = await asyncio.wait_for(
+        harness.conn._step_queue.get(), timeout=1.0
+    )
+
+    self.assertEqual(
+        step_obj.usage_metadata,
+        types.UsageMetadata(
+            prompt_token_count=150,
+            cached_content_token_count=50,
+            candidates_token_count=75,
+            thoughts_token_count=25,
+            total_token_count=250,
+        ),
+    )
+
+  async def test_ws_reader_parses_usage_metadata_before_step_queued(self):
+    """Verifies that usage_metadata received before a step is queued is attached to the next queued step."""
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
+        process=self.mock_process,
+    )
+
+    # 1. Send an event with usage_metadata but no step_update (e.g. state running or whatever)
+    event_1 = localharness_pb2.OutputEvent(
+        trajectory_state_update=localharness_pb2.TrajectoryStateUpdate(
+            trajectory_id="main",
+            state=localharness_pb2.TrajectoryStateUpdate.STATE_RUNNING,
+        ),
+        usage_metadata=localharness_pb2.UsageMetadata(
+            prompt_token_count=100,
+            total_token_count=100,
+        ),
+    )
+    await harness.send_event(event_1)
+
+    # 2. Send a step_update event
+    step_event = localharness_pb2.OutputEvent(
+        step_update=localharness_pb2.StepUpdate(
+            cascade_id="main",
+            trajectory_id="main",
+            step_index=1,
+            text="step content",
+            state=localharness_pb2.StepUpdate.STATE_ACTIVE,
+            source=localharness_pb2.StepUpdate.SOURCE_MODEL,
+        )
+    )
+    await harness.send_event(step_event)
+
+    # 3. Read the queued step and assert it has the usage metadata attached
+    step_obj = await asyncio.wait_for(
+        harness.conn._step_queue.get(), timeout=1.0
+    )
+
+    self.assertEqual(
+        step_obj.usage_metadata,
+        types.UsageMetadata(
+            prompt_token_count=100,
+            total_token_count=100,
+        ),
+    )
+
   async def test_subagent_running_tracked(self):
     """Verifies STATE_RUNNING adds subagent to active set."""
     hr = hook_runner.HookRunner()
